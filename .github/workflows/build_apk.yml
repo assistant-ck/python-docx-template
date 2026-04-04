@@ -1,33 +1,27 @@
-name: Build Private Repo APK
+name: Build Private App APK
 
 on:
-  # 支持在 GitHub Actions 页面手动触发构建
+  # 允许手动触发，并可选择性地输入版本号信息
   workflow_dispatch:
     inputs:
-      branch:
-        description: 'Branch to build'
+      version:
+        description: '发布版本 (例如: v0.0.2)'
         required: false
-        default: 'main'
+        default: 'latest'
 
 jobs:
   build-apk:
     runs-on: ubuntu-latest
-    env:
-      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-      KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-      KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
     steps:
-      # 1. 检出私有仓库代码
+      # 1. 使用提供的 Token 检出私有仓库代码
       - name: Checkout Private Repository
         uses: actions/checkout@v4
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: ${{ github.event.inputs.branch }}
 
-      # 2. 环境准备 (Node.js 20 & Java 17)
+      # 2. 准备 Node.js 和 Java 环境
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -39,15 +33,40 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # 3. 安装依赖并生成原生 Android 工程
+      # 3. 安装项目依赖
       - name: Install dependencies
-        run: npm ci
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then
+            npm ci --include=optional
+          else
+            npm install --include=optional
+          fi
 
+      # 4. 验证依赖并处理 lightningcss (针对 Linux 环境)
+      - name: Verify Metro config dependencies
+        run: |
+          set -e
+          node -e "require('./metro.config.js'); console.log('Metro config loaded successfully')"
+          
+      - name: Ensure lightningcss Linux binary is available
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          npm rebuild lightningcss || true
+          node -e "require('./node_modules/react-native-css-interop/node_modules/lightningcss/node/index.js'); console.log('lightningcss native binding loaded')"
+
+      # 5. 执行 Expo prebuild 生成 Android 原生工程
       - name: Generate Android project
-        run: npm run prebuild:android:ci
+        run: npm run prebuild:android
 
-      # 4. 配置签名文件
+      # 6. 配置签名文件 (使用设定的 Secrets)
       - name: Prepare signing files
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           mkdir -p android/app
           echo "$KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
@@ -58,17 +77,18 @@ jobs:
           keyPassword=$KEY_PASSWORD
           EOF
 
-      # 5. 赋予 gradlew 执行权限并打包 Release APK
-      - name: Grant gradlew execute permission
-        run: chmod +x android/gradlew
-
+      # 7. 编译构建 Release APK
       - name: Build release APK
-        run: npm run build:apk:release:ci
+        env:
+          NODE_ENV: production
+        run: |
+          chmod +x android/gradlew
+          cd android && ./gradlew assembleRelease
 
-      # 6. 将 APK 作为 Artifact 上传（回传）
+      # 8. 将编译好的 APK 作为产物上传回传到当前公开仓库的 Action 运行记录中
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release-apk
+          name: app-release-${{ github.event.inputs.version }}
           path: android/app/build/outputs/apk/release/*.apk
-          retention-days: 7
+          retention-days: 7 # 产物保留天数，可自行调整
