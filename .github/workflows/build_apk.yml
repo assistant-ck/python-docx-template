@@ -1,4 +1,4 @@
-name: Build Android
+name: Build Android (Debug)
 
 on:
   workflow_dispatch:
@@ -43,9 +43,10 @@ jobs:
           java-version: '17'
 
       - name: Install dependencies
+        # 完全输出 npm 安装日志
         run: |
-          npm ci > /dev/null 2>&1
-          npm run prebuild:android:ci > /dev/null 2>&1
+          npm ci
+          npm run prebuild:android:ci
 
       - name: Prepare signing files
         run: |
@@ -60,7 +61,8 @@ jobs:
           chmod +x android/gradlew
 
       - name: Build release APK
-        run: npm run build:apk:release:ci > build_log.txt 2>&1 || (echo "Build Failed! Check environment." && exit 1)
+        # 移除日志重定向，允许在 Actions 控制台直接看到 Gradle 编译输出
+        run: npm run build:apk:release:ci
 
       - name: Upload to Private Release
         uses: softprops/action-gh-release@v2
@@ -72,4 +74,4 @@ jobs:
 
       - name: Bark Notification
         if: always()
-        run: curl -s "https://api.day.app/${{ secrets.BARK_KEY }}/AndroidBuild/${{ job.status }}" > /dev/null
+        run: curl -s "https://api.day.app/${{ secrets.BARK_KEY }}/AndroidBuild/${{ job.status }}"
