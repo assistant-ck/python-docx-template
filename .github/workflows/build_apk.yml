@@ -1,22 +1,16 @@
-name: Build Android (Debug)
+name: Build Private Repo APK
 
 on:
+  # 支持在 GitHub Actions 页面手动触发构建
   workflow_dispatch:
     inputs:
       branch:
-        description: 'branch'
+        description: 'Branch to build'
+        required: false
         default: 'main'
-        required: true
-        type: string
-      release_tag:
-        description: 'tag'
-        required: true
-        type: string
-
-permissions: {}
 
 jobs:
-  build:
+  build-apk:
     runs-on: ubuntu-latest
     env:
       KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -25,29 +19,34 @@ jobs:
       KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
     steps:
-      - name: Checkout code
+      # 1. 检出私有仓库代码
+      - name: Checkout Private Repository
         uses: actions/checkout@v4
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: ${{ inputs.branch }}
+          ref: ${{ github.event.inputs.branch }}
 
-      - name: Setup Environment
+      # 2. 环境准备 (Node.js 20 & Java 17)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
-      - uses: actions/setup-java@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      # 3. 安装依赖并生成原生 Android 工程
       - name: Install dependencies
-        # 完全输出 npm 安装日志
-        run: |
-          npm install --include=optional
-          npm run prebuild:android:ci
+        run: npm ci
 
+      - name: Generate Android project
+        run: npm run prebuild:android:ci
+
+      # 4. 配置签名文件
       - name: Prepare signing files
         run: |
           mkdir -p android/app
@@ -58,20 +57,18 @@ jobs:
           keyAlias=$KEYSTORE_ALIAS
           keyPassword=$KEY_PASSWORD
           EOF
-          chmod +x android/gradlew
+
+      # 5. 赋予 gradlew 执行权限并打包 Release APK
+      - name: Grant gradlew execute permission
+        run: chmod +x android/gradlew
 
       - name: Build release APK
-        # 移除日志重定向，允许在 Actions 控制台直接看到 Gradle 编译输出
         run: npm run build:apk:release:ci
 
-      - name: Upload to Private Release
-        uses: softprops/action-gh-release@v2
+      # 6. 将 APK 作为 Artifact 上传（回传）
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
         with:
-          repository: ${{ secrets.PRIVATE_REPO_NAME }}
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          tag_name: ${{ inputs.release_tag }}
-          files: android/app/build/outputs/apk/release/*.apk
-
-      - name: Bark Notification
-        if: always()
-        run: curl -s "https://api.day.app/${{ secrets.BARK_KEY }}/AndroidBuild/${{ job.status }}"
+          name: release-apk
+          path: android/app/build/outputs/apk/release/*.apk
+          retention-days: 7
