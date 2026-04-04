@@ -1,53 +1,51 @@
-name: Build Android APK
+name: Build Android
 
 on:
-  repository_dispatch:
-    types: [build-release]
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Release Tag (例如: v1.0.0)'
+      branch:
+        description: 'branch'
+        default: 'main'
+        required: true
+        type: string
+      release_tag:
+        description: 'tag'
         required: true
         type: string
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
-  build-apk:
+  build:
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ github.event.client_payload.tag || inputs.tag }}
       KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
       KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
       KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
       KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
     steps:
-      - name: Checkout private repository
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
-          token: ${{ secrets.PRIVATE_REPO_PAT }}
-          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ inputs.branch }}
 
-      - name: Setup Node.js
+      - name: Setup Environment
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Install dependencies
-        run: npm ci
-
-      - name: Generate Android project
-        run: npm run prebuild:android:ci
+        run: |
+          npm ci > /dev/null 2>&1
+          npm run prebuild:android:ci > /dev/null 2>&1
 
       - name: Prepare signing files
         run: |
@@ -59,18 +57,19 @@ jobs:
           keyAlias=$KEYSTORE_ALIAS
           keyPassword=$KEY_PASSWORD
           EOF
-
-      - name: Grant gradlew execute permission
-        run: chmod +x android/gradlew
+          chmod +x android/gradlew
 
       - name: Build release APK
-        run: npm run build:apk:release:ci
+        run: npm run build:apk:release:ci > build_log.txt 2>&1 || (echo "Build Failed! Check environment." && exit 1)
 
-      - name: Upload to GitHub Release
+      - name: Upload to Private Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: Release ${{ env.RELEASE_TAG }}
+          repository: ${{ secrets.PRIVATE_REPO_NAME }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          tag_name: ${{ inputs.release_tag }}
           files: android/app/build/outputs/apk/release/*.apk
-          # 允许更新已存在的 Release
-          make_latest: true
+
+      - name: Bark Notification
+        if: always()
+        run: curl -s "https://api.day.app/${{ secrets.BARK_KEY }}/AndroidBuild/${{ job.status }}" > /dev/null
