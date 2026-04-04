@@ -45,7 +45,7 @@ jobs:
       - name: Install dependencies
         # 完全输出 npm 安装日志
         run: |
-          npm ci
+          npm install --include=optional
           npm run prebuild:android:ci
 
       - name: Prepare signing files
