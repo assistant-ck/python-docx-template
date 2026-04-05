@@ -100,13 +100,22 @@ jobs:
       - name: Build and export IPA
         run: |
           cd ios
-          # Expo 会把横杠去掉，通常为 jfapp
-          WORKSPACE="jfapp.xcworkspace"
-          SCHEME="jfapp"
+          
+          # 动态获取目录下的 .xcworkspace 文件名及其 Scheme
+          WORKSPACE=$(ls -1 | grep "\.xcworkspace" | head -n 1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          
+          echo "==== 自动检测到原生命名 ===="
+          echo "Workspace: $WORKSPACE"
+          echo "Scheme: $SCHEME"
+          echo "==========================="
 
           ARCHIVE_PATH="build/$SCHEME.xcarchive"
+          
+          # Step 1: 归档 (Archive)
           xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$ARCHIVE_PATH" archive ONLY_ACTIVE_ARCH=NO CODE_SIGN_STYLE=Manual
 
+          # Step 2: 导出 IPA
           xcodebuild -exportArchive -archivePath "$ARCHIVE_PATH" -exportOptionsPlist exportOptions.plist -exportPath build/ipa
 
       - name: Upload IPA to Private Repo Release
