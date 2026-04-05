@@ -97,26 +97,49 @@ jobs:
           </plist>
           EOF
 
+      # 8. Xcode 编译归档并导出 IPA
       - name: Build and export IPA
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           cd ios
           
-          # 动态获取目录下的 .xcworkspace 文件名及其 Scheme
+          # 1. 动态获取 Workspace 和 Scheme
           WORKSPACE=$(ls -1 | grep "\.xcworkspace" | head -n 1)
           SCHEME=$(basename "$WORKSPACE" .xcworkspace)
           
-          echo "==== 自动检测到原生命名 ===="
+          # 2. 从描述文件中硬提取 UUID
+          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
+          # 使用 security cms 解码描述文件并抓取 UUID
+          PP_UUID=$(security cms -D -i "$PP_PATH" | grep -A1 UUID | grep -o "[-a-zA-Z0-9]\{36\}")
+          
+          echo "==== 签名参数注入 ===="
           echo "Workspace: $WORKSPACE"
           echo "Scheme: $SCHEME"
+          echo "Team ID: $APPLE_TEAM_ID"
+          echo "Profile UUID: $PP_UUID"
           echo "==========================="
 
           ARCHIVE_PATH="build/$SCHEME.xcarchive"
           
-          # Step 1: 归档 (Archive)
-          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$ARCHIVE_PATH" archive ONLY_ACTIVE_ARCH=NO CODE_SIGN_STYLE=Manual
+          # Step 1: 归档 (Archive) - 强制传入 Team ID 和描述文件 UUID
+          xcodebuild -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$ARCHIVE_PATH" \
+            archive \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PROVISIONING_PROFILE="$PP_UUID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PP_UUID"
 
           # Step 2: 导出 IPA
-          xcodebuild -exportArchive -archivePath "$ARCHIVE_PATH" -exportOptionsPlist exportOptions.plist -exportPath build/ipa
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist exportOptions.plist \
+            -exportPath build/ipa
 
       - name: Upload IPA to Private Repo Release
         uses: softprops/action-gh-release@v2
