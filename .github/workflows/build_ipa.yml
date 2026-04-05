@@ -110,7 +110,6 @@ jobs:
           
           # 2. 从描述文件中硬提取 UUID
           PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
-          # 使用 security cms 解码描述文件并抓取 UUID
           PP_UUID=$(security cms -D -i "$PP_PATH" | grep -A1 UUID | grep -o "[-a-zA-Z0-9]\{36\}")
           
           echo "==== 签名参数注入 ===="
@@ -122,7 +121,7 @@ jobs:
 
           ARCHIVE_PATH="build/$SCHEME.xcarchive"
           
-          # Step 1: 归档 (Archive) - 强制传入 Team ID 和描述文件 UUID
+          # Step 1: 归档 (Archive) - 强制声明我们要用 Distribution (分发版) 证书，不要找 Development
           xcodebuild -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -configuration Release \
@@ -133,7 +132,8 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
             PROVISIONING_PROFILE="$PP_UUID" \
-            PROVISIONING_PROFILE_SPECIFIER="$PP_UUID"
+            PROVISIONING_PROFILE_SPECIFIER="$PP_UUID" \
+            CODE_SIGN_IDENTITY="iPhone Distribution"
 
           # Step 2: 导出 IPA
           xcodebuild -exportArchive \
