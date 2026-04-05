@@ -84,9 +84,11 @@ jobs:
           chmod +x android/gradlew
           cd android && ./gradlew assembleRelease
 
-      - name: Upload
+      - name: Upload APK
         uses: softprops/action-gh-release@v2
         with:
+          repository: ${{ secrets.PRIVATE_REPO_NAME }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           tag_name: ${{ github.event.inputs.tag_name }}
           name: Release ${{ github.event.inputs.tag_name }}
           body: ${{ github.event.inputs.release_notes }}
