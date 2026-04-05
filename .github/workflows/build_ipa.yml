@@ -78,29 +78,11 @@ jobs:
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/
 
-      - name: Create exportOptions.plist
-        run: |
-          cat > ios/exportOptions.plist <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-            <dict>
-              <key>method</key>
-              <string>${{ secrets.IOS_EXPORT_METHOD }}</string>
-              <key>teamID</key>
-              <string>${{ secrets.APPLE_TEAM_ID }}</string>
-              <key>uploadBitcode</key>
-              <false/>
-              <key>compileBitcode</key>
-              <false/>
-            </dict>
-          </plist>
-          EOF
-
-      # 8. Xcode 编译归档并导出 IPA
+      # 7 & 8. 动态生成配置、编译归档并导出 IPA
       - name: Build and export IPA
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IOS_EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD }}
         run: |
           cd ios
           
@@ -112,16 +94,44 @@ jobs:
           PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
           PP_UUID=$(security cms -D -i "$PP_PATH" | grep -A1 UUID | grep -o "[-a-zA-Z0-9]\{36\}")
           
-          echo "==== 签名参数注入 ===="
+          # 3. 精准提取 Bundle ID (直接读取你刚改好的 app.json)
+          BUNDLE_ID=$(node -p "require('../app.json').expo.ios.bundleIdentifier")
+          
+          echo "==== 签名与导出参数 ===="
           echo "Workspace: $WORKSPACE"
           echo "Scheme: $SCHEME"
           echo "Team ID: $APPLE_TEAM_ID"
           echo "Profile UUID: $PP_UUID"
-          echo "==========================="
+          echo "Bundle ID: $BUNDLE_ID"
+          echo "Export Method: $IOS_EXPORT_METHOD"
+          echo "======================="
+
+          # 4. 动态生成完美版的 exportOptions.plist (加入 provisioningProfiles 映射)
+          cat > exportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>$IOS_EXPORT_METHOD</string>
+            <key>teamID</key>
+            <string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>iPhone Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$BUNDLE_ID</key>
+              <string>$PP_UUID</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
 
           ARCHIVE_PATH="build/$SCHEME.xcarchive"
           
-          # Step 1: 归档 (Archive) - 强制声明我们要用 Distribution (分发版) 证书，不要找 Development
+          # Step 1: 归档 (Archive)
           xcodebuild -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -configuration Release \
@@ -135,7 +145,7 @@ jobs:
             PROVISIONING_PROFILE_SPECIFIER="$PP_UUID" \
             CODE_SIGN_IDENTITY="iPhone Distribution"
 
-          # Step 2: 导出 IPA
+          # Step 2: 导出 IPA (Export)
           xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
             -exportOptionsPlist exportOptions.plist \
