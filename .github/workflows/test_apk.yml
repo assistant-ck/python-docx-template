@@ -1,0 +1,97 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '发布版本标签 (例如: v0.0.2)'
+        required: true
+        type: string
+      release_notes:
+        description: '版本更新说明'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    # 变更为 macos-26，默认基于 Apple Silicon (ARM64) 芯片，性能强劲且环境最新
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO_NAME }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install dependencies
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then
+            npm ci --include=optional
+          else
+            npm install --include=optional
+          fi
+
+      - name: Verify Metro config dependencies
+        run: |
+          set -e
+          node -e "require('./metro.config.js'); console.log('Metro config loaded successfully')"
+          
+      - name: Ensure lightningcss native binary is available
+        if: runner.os == 'macOS'
+        run: |
+          set -e
+          npm rebuild lightningcss || true
+          node -e "require('./node_modules/react-native-css-interop/node_modules/lightningcss/node/index.js'); console.log('lightningcss native binding loaded')"
+
+      - name: Generate Android project
+        run: npm run prebuild:android
+
+      - name: Prepare signing files
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          mkdir -p android/app
+          # macOS BSD base64 需要使用 -D 参数进行解码
+          echo "$KEYSTORE_BASE64" | base64 -D > android/app/release.keystore
+          cat > android/keystore.properties <<EOF
+          storeFile=release.keystore
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEYSTORE_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      - name: Build release APK
+        env:
+          NODE_ENV: production
+        run: |
+          chmod +x android/gradlew
+          cd android && ./gradlew assembleRelease
+
+      - name: Upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ secrets.PRIVATE_REPO_NAME }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          tag_name: ${{ github.event.inputs.tag_name }}
+          name: Release ${{ github.event.inputs.tag_name }}
+          body: ${{ github.event.inputs.release_notes }}
+          files: android/app/build/outputs/apk/release/*.apk
