@@ -1,4 +1,4 @@
-name: Build ipa
+name: Build IPA
 
 on:
   workflow_dispatch:
@@ -49,49 +49,50 @@ jobs:
           BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE }}
           KEYCHAIN_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
-          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          : "${BUILD_CERTIFICATE_BASE64:?IOS_CERTIFICATE is required}"
+          : "${BUILD_PROVISION_PROFILE_BASE64:?IOS_PROVISIONING_PROFILE is required}"
 
-          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode > $CERTIFICATE_PATH
-          echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > $PP_PATH
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          PP_PATH="$RUNNER_TEMP/build_pp.mobileprovision"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
 
-          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          printf '%s' "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          printf '%s' "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > "$PP_PATH"
 
-          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
-          security list-keychain -d user -s $KEYCHAIN_PATH
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH || true
+          SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk '/^[[:space:]]*[0-9]+\)/ {print $2; exit}')
+          : "${SIGNING_IDENTITY:?No valid signing identity with a private key was found in IOS_CERTIFICATE}"
 
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/
+          security cms -D -i "$PP_PATH" > "$PROFILE_PLIST"
+          PP_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILE_DIR"
+          cp "$PP_PATH" "$PROFILE_DIR/$PP_UUID.mobileprovision"
+
+          printf 'SIGNING_IDENTITY=%s\n' "$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          printf 'PP_UUID=%s\n' "$PP_UUID" >> "$GITHUB_ENV"
 
       - name: Build and export IPA
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          IOS_EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD || 'ad-hoc' }}
+          IOS_EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD }}
         run: |
+          : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}"
+          : "${IOS_EXPORT_METHOD:?IOS_EXPORT_METHOD is required}"
           cd ios
-          
-          WORKSPACE="Runner.xcworkspace"
-          SCHEME="Runner"
-          
-          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
-          PP_UUID=$(security cms -D -i "$PP_PATH" | grep -A1 UUID | grep -o "[-a-zA-Z0-9]\{36\}") || true
-          BUNDLE_ID="com.GpEx.8KIR7"
-          
-          echo "==== 签名与导出参数 ===="
-          echo "Workspace: $WORKSPACE"
-          echo "Scheme: $SCHEME"
-          echo "Team ID: $APPLE_TEAM_ID"
-          echo "Profile UUID: $PP_UUID"
-          echo "Bundle ID: $BUNDLE_ID"
-          echo "Export Method: $IOS_EXPORT_METHOD"
-          echo "======================="
 
-          cat > exportOptions.plist << EOF
+          BUNDLE_ID="com.GpEx.8KIR7"
+          ARCHIVE_PATH="$RUNNER_TEMP/Runner.xcarchive"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+
+          cat > exportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -103,7 +104,7 @@ jobs:
             <key>signingStyle</key>
             <string>manual</string>
             <key>signingCertificate</key>
-            <string>iPhone Distribution</string>
+            <string>$SIGNING_IDENTITY</string>
             <key>provisioningProfiles</key>
             <dict>
               <key>$BUNDLE_ID</key>
@@ -113,19 +114,20 @@ jobs:
           </plist>
           EOF
 
-          ARCHIVE_PATH="build/${SCHEME}.xcarchive"
-          
-          xcodebuild -workspace "$WORKSPACE" \
-            -scheme "$SCHEME" \
+          xcodebuild -workspace Runner.xcworkspace \
+            -scheme Runner \
             -configuration Release \
-            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -archivePath "$ARCHIVE_PATH" \
             archive \
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" \
+            "CODE_SIGN_IDENTITY[sdk=iphoneos*]=$SIGNING_IDENTITY" \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
             PROVISIONING_PROFILE="$PP_UUID" \
-            PROVISIONING_PROFILE_SPECIFIER="$PP_UUID"
+            PROVISIONING_PROFILE_SPECIFIER="$PP_UUID" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH"
 
           xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
@@ -141,8 +143,12 @@ jobs:
           name: Release ${{ github.event.inputs.tag_name }}
           body: ${{ github.event.inputs.release_notes }}
           files: ios/build/ipa/*.ipa
+          fail_on_unmatched_files: true
 
       - name: Clean up keychain
         if: always()
         run: |
-          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db || true
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
