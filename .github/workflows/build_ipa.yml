@@ -92,6 +92,25 @@ jobs:
           ARCHIVE_PATH="$RUNNER_TEMP/Runner.xcarchive"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
 
+          gem install --user-install xcodeproj --version 1.27.0 --no-document
+          ruby - <<'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open('Runner.xcodeproj')
+          target = project.targets.find { |item| item.name == 'Runner' }
+          raise 'Runner target was not found' unless target
+          config = target.build_configurations.find { |item| item.name == 'Release' }
+          raise 'Runner Release configuration was not found' unless config
+          settings = config.build_settings
+          settings['CODE_SIGN_STYLE'] = 'Manual'
+          settings['CODE_SIGN_IDENTITY'] = ENV.fetch('SIGNING_IDENTITY')
+          settings['CODE_SIGN_IDENTITY[sdk=iphoneos*]'] = ENV.fetch('SIGNING_IDENTITY')
+          settings['DEVELOPMENT_TEAM'] = ENV.fetch('APPLE_TEAM_ID')
+          settings['PROVISIONING_PROFILE'] = ENV.fetch('PP_UUID')
+          settings['PROVISIONING_PROFILE_SPECIFIER'] = ENV.fetch('PP_UUID')
+          settings['OTHER_CODE_SIGN_FLAGS'] = "$(inherited) --keychain #{ENV.fetch('RUNNER_TEMP')}/app-signing.keychain-db"
+          project.save
+          RUBY
+
           cat > exportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -120,14 +139,7 @@ jobs:
             -destination 'generic/platform=iOS' \
             -archivePath "$ARCHIVE_PATH" \
             archive \
-            ONLY_ACTIVE_ARCH=NO \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" \
-            "CODE_SIGN_IDENTITY[sdk=iphoneos*]=$SIGNING_IDENTITY" \
-            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-            PROVISIONING_PROFILE="$PP_UUID" \
-            PROVISIONING_PROFILE_SPECIFIER="$PP_UUID" \
-            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH"
+            ONLY_ACTIVE_ARCH=NO
 
           xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
