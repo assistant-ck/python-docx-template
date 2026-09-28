@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: '发布版本标签 (例如: v0.0.2)'
+        description: '发布版本标签 (例如: v0.1.1)'
         required: true
         type: string
       release_notes:
@@ -20,6 +20,7 @@ jobs:
     runs-on: macos-latest
     env:
       LANG: en_US.UTF-8
+      RELEASE_TAG: ${{ inputs.tag_name }}
 
     steps:
       - name: Checkout Private Repository
@@ -27,7 +28,7 @@ jobs:
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: ${{ github.event.inputs.tag_name }}
+          ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
       - name: Setup Flutter
@@ -146,15 +147,22 @@ jobs:
             -exportOptionsPlist exportOptions.plist \
             -exportPath build/ipa
 
+      - name: Rename IPA
+        run: |
+          mkdir -p release-packages
+          set -- ios/build/ipa/*.ipa
+          [ "$#" -eq 1 ]
+          cp "$1" "release-packages/jf-app-$RELEASE_TAG-ios.ipa"
+
       - name: Upload IPA to Private Repo Release
         uses: softprops/action-gh-release@v2
         with:
-          repository: ${{ secrets.PRIVATE_REPO_NAME }} 
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}    
-          tag_name: ${{ github.event.inputs.tag_name }}
-          name: Release ${{ github.event.inputs.tag_name }}
-          body: ${{ github.event.inputs.release_notes }}
-          files: ios/build/ipa/*.ipa
+          repository: ${{ secrets.PRIVATE_REPO_NAME }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          tag_name: ${{ inputs.tag_name }}
+          name: Release ${{ inputs.tag_name }}
+          body: ${{ inputs.release_notes }}
+          files: release-packages/*.ipa
           fail_on_unmatched_files: true
 
       - name: Clean up keychain
