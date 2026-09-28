@@ -12,6 +12,9 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: write
+
 jobs:
   build-ios:
     runs-on: macos-latest
@@ -24,33 +27,25 @@ jobs:
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ github.event.inputs.tag_name }}
+          fetch-depth: 0
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
         with:
-          node-version: '20'
+          channel: 'stable'
+          cache: true
 
-      - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.1'
-
-      - name: Install JS dependencies
-        run: |
-          set -e
-          if [ -f package-lock.json ]; then
-            npm ci --include=optional
-          else
-            npm install --include=optional
-          fi
-
-      - name: Generate iOS project
-        run: npx expo prebuild --platform ios --non-interactive
+      - name: Install dependencies
+        run: flutter pub get
 
       - name: Install CocoaPods
         run: |
           cd ios
-          pod install --repo-update
+          pod install --repo-update || pod install
+
+      - name: Build Flutter iOS release artifacts
+        run: flutter build ios --release --no-codesign
 
       - name: Install Apple Certificate and Provisioning Profile
         env:
@@ -67,35 +62,30 @@ jobs:
           echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > $PP_PATH
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security set-key-settings -lut 21600 $KEYCHAIN_PATH
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
           security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH
 
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH || true
 
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/
 
-      # 7 & 8. 动态生成配置、编译归档并导出 IPA
       - name: Build and export IPA
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          IOS_EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD }}
+          IOS_EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD || 'ad-hoc' }}
         run: |
           cd ios
           
-          # 1. 动态获取 Workspace 和 Scheme
-          WORKSPACE=$(ls -1 | grep "\.xcworkspace" | head -n 1)
-          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          WORKSPACE="Runner.xcworkspace"
+          SCHEME="Runner"
           
-          # 2. 从描述文件中硬提取 UUID
           PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
-          PP_UUID=$(security cms -D -i "$PP_PATH" | grep -A1 UUID | grep -o "[-a-zA-Z0-9]\{36\}")
-          
-          # 3. 精准提取 Bundle ID (直接读取你刚改好的 app.json)
-          BUNDLE_ID=$(node -p "require('../app.json').expo.ios.bundleIdentifier")
+          PP_UUID=$(security cms -D -i "$PP_PATH" | grep -A1 UUID | grep -o "[-a-zA-Z0-9]\{36\}") || true
+          BUNDLE_ID="com.GpEx.8KIR7"
           
           echo "==== 签名与导出参数 ===="
           echo "Workspace: $WORKSPACE"
@@ -106,7 +96,6 @@ jobs:
           echo "Export Method: $IOS_EXPORT_METHOD"
           echo "======================="
 
-          # 4. 动态生成完美版的 exportOptions.plist (加入 provisioningProfiles 映射)
           cat > exportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -129,9 +118,8 @@ jobs:
           </plist>
           EOF
 
-          ARCHIVE_PATH="build/$SCHEME.xcarchive"
+          ARCHIVE_PATH="build/${SCHEME}.xcarchive"
           
-          # Step 1: 归档 (Archive)
           xcodebuild -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -configuration Release \
@@ -142,10 +130,8 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
             PROVISIONING_PROFILE="$PP_UUID" \
-            PROVISIONING_PROFILE_SPECIFIER="$PP_UUID" \
-            CODE_SIGN_IDENTITY="iPhone Distribution"
+            PROVISIONING_PROFILE_SPECIFIER="$PP_UUID"
 
-          # Step 2: 导出 IPA (Export)
           xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
             -exportOptionsPlist exportOptions.plist \
@@ -161,7 +147,6 @@ jobs:
           body: ${{ github.event.inputs.release_notes }}
           files: ios/build/ipa/*.ipa
 
-      # 10. 清理钥匙串
       - name: Clean up keychain
         if: always()
         run: |
