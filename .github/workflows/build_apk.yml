@@ -52,12 +52,15 @@ jobs:
           if [ -n "$KEYSTORE_BASE64" ]; then
             mkdir -p android/app
             echo "$KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
-            cat > android/keystore.properties <<EOF
-            storeFile=app/release.keystore
-            storePassword=$KEYSTORE_PASSWORD
-            keyAlias=$KEYSTORE_ALIAS
-            keyPassword=$KEY_PASSWORD
-            EOF
+            cat > android/keystore.properties << 'EOF'
+          storeFile=app/release.keystore
+          storePassword=${KEYSTORE_PASSWORD}
+          keyAlias=${KEYSTORE_ALIAS}
+          keyPassword=${KEY_PASSWORD}
+          EOF
+            sed -i "s|\${KEYSTORE_PASSWORD}|$KEYSTORE_PASSWORD|g" android/keystore.properties
+            sed -i "s|\${KEYSTORE_ALIAS}|$KEYSTORE_ALIAS|g" android/keystore.properties
+            sed -i "s|\${KEY_PASSWORD}|$KEY_PASSWORD|g" android/keystore.properties
           fi
 
       - name: Build release APK
