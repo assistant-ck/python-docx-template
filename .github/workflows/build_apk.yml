@@ -25,11 +25,7 @@ jobs:
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+          ref: ${{ github.event.inputs.tag_name }}
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -37,29 +33,14 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
       - name: Install dependencies
-        run: |
-          set -e
-          if [ -f package-lock.json ]; then
-            npm ci --include=optional
-          else
-            npm install --include=optional
-          fi
-
-      - name: Verify Metro config dependencies
-        run: |
-          set -e
-          node -e "require('./metro.config.js'); console.log('Metro config loaded successfully')"
-          
-      - name: Ensure lightningcss Linux binary is available
-        if: runner.os == 'Linux'
-        run: |
-          set -e
-          npm rebuild lightningcss || true
-          node -e "require('./node_modules/react-native-css-interop/node_modules/lightningcss/node/index.js'); console.log('lightningcss native binding loaded')"
-
-      - name: Generate Android project
-        run: npm run prebuild:android
+        run: flutter pub get
 
       - name: Prepare signing files
         env:
@@ -68,23 +49,21 @@ jobs:
           KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          mkdir -p android/app
-          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
-          cat > android/keystore.properties <<EOF
-          storeFile=release.keystore
-          storePassword=$KEYSTORE_PASSWORD
-          keyAlias=$KEYSTORE_ALIAS
-          keyPassword=$KEY_PASSWORD
-          EOF
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            mkdir -p android/app
+            echo "$KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
+            cat > android/keystore.properties <<EOF
+            storeFile=app/release.keystore
+            storePassword=$KEYSTORE_PASSWORD
+            keyAlias=$KEYSTORE_ALIAS
+            keyPassword=$KEY_PASSWORD
+            EOF
+          fi
 
       - name: Build release APK
-        env:
-          NODE_ENV: production
-        run: |
-          chmod +x android/gradlew
-          cd android && ./gradlew assembleRelease
+        run: flutter build apk --release
 
-      - name: Upload APK
+      - name: Upload APK to Release
         uses: softprops/action-gh-release@v2
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
@@ -92,4 +71,4 @@ jobs:
           tag_name: ${{ github.event.inputs.tag_name }}
           name: Release ${{ github.event.inputs.tag_name }}
           body: ${{ github.event.inputs.release_notes }}
-          files: android/app/build/outputs/apk/release/*.apk
+          files: build/app/outputs/flutter-apk/*.apk
