@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: '发布版本标签 (例如: v0.0.2)'
+        description: '发布版本标签 (例如: v0.1.1)'
         required: true
         type: string
       release_notes:
@@ -18,6 +18,8 @@ permissions:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag_name }}
 
     steps:
       - name: Checkout Code
@@ -25,7 +27,7 @@ jobs:
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: ${{ github.event.inputs.tag_name }}
+          ref: ${{ inputs.tag_name }}
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -63,16 +65,28 @@ jobs:
           keyPassword=$KEY_PASSWORD
           EOF
 
-      - name: Build release APK
-        run: flutter build apk --release --split-per-abi
+      - name: Build APKs for each architecture
+        run: |
+          flutter build apk --release --split-per-abi
+          mkdir -p release-packages
+          for ABI in armeabi-v7a arm64-v8a x86_64; do
+            cp "build/app/outputs/flutter-apk/app-$ABI-release.apk" \
+              "release-packages/jf-app-$RELEASE_TAG-android-$ABI.apk"
+          done
 
-      - name: Upload APK to Release
+      - name: Build universal APK
+        run: |
+          flutter build apk --release
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "release-packages/jf-app-$RELEASE_TAG-android-universal.apk"
+
+      - name: Upload APKs to Release
         uses: softprops/action-gh-release@v2
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          tag_name: ${{ github.event.inputs.tag_name }}
-          name: Release ${{ github.event.inputs.tag_name }}
-          body: ${{ github.event.inputs.release_notes }}
-          files: build/app/outputs/flutter-apk/*-release.apk
+          tag_name: ${{ inputs.tag_name }}
+          name: Release ${{ inputs.tag_name }}
+          body: ${{ inputs.release_notes }}
+          files: release-packages/*.apk
           fail_on_unmatched_files: true
