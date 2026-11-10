@@ -1,29 +1,45 @@
 name: Build IPA
 
+
 on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: '发布版本标签 (例如: v0.1.1)'
+        description: '发布版本标签 (例如: v0.3.3)'
         required: true
         type: string
       release_notes:
         description: '版本更新说明'
         required: false
         type: string
+      build_profile_bound_ipa:
+        description: '描述文件 App ID 与目标包名不同时，额外产出一个按描述文件包名签名、可直接安装的 IPA'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: ios-ipa-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.47.5'
+  APP_BUNDLE_ID: ${{ secrets.IOS_APP_BUNDLE_ID }}
+  KEYCHAIN_PASSWORD: ci-keychain-${{ github.run_id }}
+
 jobs:
   build-ios:
-    runs-on: macos-latest
+    runs-on: macos-15
+    timeout-minutes: 60
     env:
       LANG: en_US.UTF-8
       RELEASE_TAG: ${{ inputs.tag_name }}
 
     steps:
-      - name: Checkout Private Repository
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
@@ -31,25 +47,96 @@ jobs:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
+      - name: Resolve bundle identifier
+        run: |
+          set -euo pipefail
+          PBX="ios/Runner.xcodeproj/project.pbxproj"
+          fallback=$(grep -o 'PRODUCT_BUNDLE_IDENTIFIER = [^;]*;' "$PBX" 2>/dev/null | sed -e 's/.*= //' -e 's/;$//' | grep -v '\.RunnerTests$' | head -1 || true)
+          if [ -z "${APP_BUNDLE_ID:-}" ]; then
+            APP_BUNDLE_ID="$fallback"
+            echo "::warning::未获取到目标包名，回退为项目当前包名"
+          fi
+          if [ -z "$APP_BUNDLE_ID" ]; then
+            echo "::error::无法确定目标包名"
+            exit 1
+          fi
+          echo "APP_BUNDLE_ID=$APP_BUNDLE_ID" >> "$GITHUB_ENV"
+          echo "目标包名: ${APP_BUNDLE_ID}"
+
+      - name: Ensure iOS bundle identifier
+        run: |
+          set -euo pipefail
+          python3 - "$APP_BUNDLE_ID" <<'PYEOF'
+          import pathlib, re, sys
+          want = sys.argv[1]
+          pbx = pathlib.Path("ios/Runner.xcodeproj/project.pbxproj")
+          text = pbx.read_text(encoding="utf-8")
+          changed = []
+
+          def repl(m):
+              cur = m.group(1)
+              new = f"{want}.RunnerTests" if cur.endswith(".RunnerTests") else want
+              if new != cur:
+                  changed.append((cur, new))
+              return f"PRODUCT_BUNDLE_IDENTIFIER = {new};"
+
+          text = re.sub(r"PRODUCT_BUNDLE_IDENTIFIER = ([^;]+);", repl, text)
+          if changed:
+              pbx.write_text(text, encoding="utf-8")
+          print(f"修正条目数: {len(changed)}")
+          print(f"当前埋点数量: {len(re.findall(r'PRODUCT_BUNDLE_IDENTIFIER = ', text))}")
+          PYEOF
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: 'stable'
           cache: true
 
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Build Flutter iOS release artifacts
-        run: flutter build ios --release --no-codesign
+      - name: Build unsigned Flutter iOS app
+        run: |
+          set -euo pipefail
+          for attempt in 1 2; do
+            if flutter build ios --release --no-codesign; then
+              exit 0
+            fi
+            echo "::warning::flutter build ios 第 $attempt 次失败，清理后重试"
+            flutter clean
+            flutter pub get
+            sleep 15
+          done
+          echo "::error::flutter build ios 连续失败"
+          exit 1
+
+      - name: Verify app bundle
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP" || { echo "::error::未找到 $APP"; exit 1; }
+
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")
+          echo "包名: ${BUNDLE_ID}"
+          echo "版本: $VERSION ($BUILD)"
+          echo "Architectures: $(lipo -archs "$APP/Runner" 2>/dev/null || echo unknown)"
+
+          [ "$BUNDLE_ID" = "$APP_BUNDLE_ID" ] || {
+            echo "::error::iOS 包名与预期不一致"
+            exit 1
+          }
 
       - name: Install Apple Certificate and Provisioning Profile
         env:
           BUILD_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE }}
           P12_PASSWORD: ${{ secrets.IOS_CERT_P12_PASSWORD }}
           BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE }}
-          KEYCHAIN_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           : "${BUILD_CERTIFICATE_BASE64:?IOS_CERTIFICATE is required}"
           : "${BUILD_PROVISION_PROFILE_BASE64:?IOS_PROVISIONING_PROFILE is required}"
 
@@ -57,6 +144,7 @@ jobs:
           PP_PATH="$RUNNER_TEMP/build_pp.mobileprovision"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
           PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+          ENTITLEMENTS="$RUNNER_TEMP/entitlements.plist"
 
           printf '%s' "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
           printf '%s' "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > "$PP_PATH"
@@ -65,110 +153,295 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          EXISTING_KEYCHAINS=()
+          while IFS= read -r line; do
+            name=$(printf '%s' "$line" | tr -d '"' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ -n "$name" ]; then
+              EXISTING_KEYCHAINS+=("$name")
+            fi
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$KEYCHAIN_PATH" ${EXISTING_KEYCHAINS[@]+"${EXISTING_KEYCHAINS[@]}"}
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
 
           SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk '/^[[:space:]]*[0-9]+\)/ {print $2; exit}')
-          : "${SIGNING_IDENTITY:?No valid signing identity with a private key was found in IOS_CERTIFICATE}"
+          if [ -z "${SIGNING_IDENTITY:-}" ]; then
+            echo "::error::IOS_CERTIFICATE 中没有可用的代码签名标识（含私钥）"
+            security find-identity -v "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+          echo "签名标识哈希: ${SIGNING_IDENTITY:0:12}"
 
           security cms -D -i "$PP_PATH" > "$PROFILE_PLIST"
           PP_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")
+          PROFILE_APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST")
+          PROFILE_TEAM_ID=${PROFILE_APP_ID%%.*}
+          PROFILE_BUNDLE_ID=${PROFILE_APP_ID#*.}
+          PROFILE_EXPIRES=$(/usr/libexec/PlistBuddy -c 'Print :ExpirationDate' "$PROFILE_PLIST" 2>/dev/null || echo unknown)
+
+          plutil -extract Entitlements xml1 -o "$ENTITLEMENTS" "$PROFILE_PLIST"
+
           PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$PROFILE_DIR"
           cp "$PP_PATH" "$PROFILE_DIR/$PP_UUID.mobileprovision"
 
-          printf 'SIGNING_IDENTITY=%s\n' "$SIGNING_IDENTITY" >> "$GITHUB_ENV"
-          printf 'PP_UUID=%s\n' "$PP_UUID" >> "$GITHUB_ENV"
+          echo "描述文件 UUID: ${PP_UUID:0:8}"
+          echo "描述文件 App ID 与目标包名一致: $([ "$PROFILE_BUNDLE_ID" = "$APP_BUNDLE_ID" ] && echo yes || echo no)"
+          echo "描述文件过期时间: $PROFILE_EXPIRES"
+          if [ "$PROFILE_BUNDLE_ID" = "*" ]; then
+            echo "描述文件为通配 App ID，签名后包名 $APP_BUNDLE_ID 可直接安装"
+          elif [ "$PROFILE_BUNDLE_ID" != "$APP_BUNDLE_ID" ]; then
+            echo "::warning::描述文件 App ID 与包名不一致，签名产物需重签后才能安装"
+          fi
 
-      - name: Build and export IPA
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          IOS_EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD }}
+          {
+            echo "SIGNING_IDENTITY=$SIGNING_IDENTITY"
+            echo "PP_UUID=$PP_UUID"
+            echo "PROFILE_APP_ID=$PROFILE_APP_ID"
+            echo "PROFILE_TEAM_ID=$PROFILE_TEAM_ID"
+            echo "PROFILE_BUNDLE_ID=$PROFILE_BUNDLE_ID"
+            echo "ENTITLEMENTS_PATH=$ENTITLEMENTS"
+          } >> "$GITHUB_ENV"
+
+      - name: Build unsigned IPA
         run: |
-          : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}"
-          : "${IOS_EXPORT_METHOD:?IOS_EXPORT_METHOD is required}"
-          cd ios
-
-          BUNDLE_ID="com.GpEx.8KIR7"
-          ARCHIVE_PATH="$RUNNER_TEMP/Runner.xcarchive"
-          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
-
-          gem install --user-install xcodeproj --version 1.27.0 --no-document
-          ruby - <<'RUBY'
-          require 'xcodeproj'
-          project = Xcodeproj::Project.open('Runner.xcodeproj')
-          target = project.targets.find { |item| item.name == 'Runner' }
-          raise 'Runner target was not found' unless target
-          config = target.build_configurations.find { |item| item.name == 'Release' }
-          raise 'Runner Release configuration was not found' unless config
-          settings = config.build_settings
-          settings['CODE_SIGN_STYLE'] = 'Manual'
-          settings['CODE_SIGN_IDENTITY'] = ENV.fetch('SIGNING_IDENTITY')
-          settings['CODE_SIGN_IDENTITY[sdk=iphoneos*]'] = ENV.fetch('SIGNING_IDENTITY')
-          settings['DEVELOPMENT_TEAM'] = ENV.fetch('APPLE_TEAM_ID')
-          settings['PROVISIONING_PROFILE'] = ENV.fetch('PP_UUID')
-          settings['PROVISIONING_PROFILE_SPECIFIER'] = ENV.fetch('PP_UUID')
-          settings['OTHER_CODE_SIGN_FLAGS'] = "$(inherited) --keychain #{ENV.fetch('RUNNER_TEMP')}/app-signing.keychain-db"
-          project.save
-          RUBY
-
-          cat > exportOptions.plist <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>$IOS_EXPORT_METHOD</string>
-            <key>teamID</key>
-            <string>$APPLE_TEAM_ID</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>signingCertificate</key>
-            <string>$SIGNING_IDENTITY</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>$BUNDLE_ID</key>
-              <string>$PP_UUID</string>
-            </dict>
-          </dict>
-          </plist>
-          EOF
-
-          xcodebuild -workspace Runner.xcworkspace \
-            -scheme Runner \
-            -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -archivePath "$ARCHIVE_PATH" \
-            archive \
-            ONLY_ACTIVE_ARCH=NO
-
-          xcodebuild -exportArchive \
-            -archivePath "$ARCHIVE_PATH" \
-            -exportOptionsPlist exportOptions.plist \
-            -exportPath build/ipa
-
-      - name: Rename IPA
-        run: |
+          set -euo pipefail
           mkdir -p release-packages
-          set -- ios/build/ipa/*.ipa
-          [ "$#" -eq 1 ]
-          cp "$1" "release-packages/jf-app-$RELEASE_TAG-ios.ipa"
+          STAGE="$RUNNER_TEMP/ios-unsigned"
+          SRC="build/ios/iphoneos/Runner.app"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/Payload"
+          cp -R "$SRC" "$STAGE/Payload/Runner.app"
 
-      - name: Upload IPA to Private Repo Release
-        uses: softprops/action-gh-release@v2
+          APP="$STAGE/Payload/Runner.app"
+          for target in "$APP"/Frameworks/*.framework "$APP"/Frameworks/*.dylib; do
+            [ -e "$target" ] || continue
+            sig_info=$(codesign -dv "$target" 2>&1 || true)
+            case "$sig_info" in
+              *Signature=adhoc*) ;;
+              *) continue ;;
+            esac
+            rel="${target#"$APP"/}"
+            if [ -d "$target" ]; then
+              exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$target/Info.plist" 2>/dev/null || true)
+              probe="${exe:+$target/$exe}"
+            else
+              probe="$target"
+            fi
+            echo "剥离 ad-hoc 签名: $rel"
+            codesign --remove-signature "$target" || true
+            if [ -n "$probe" ] && [ -e "$probe" ] && ! lipo -archs "$probe" >/dev/null 2>&1; then
+              echo "::warning::$rel 剥离后二进制异常，回滚为原始未签名文件"
+              rm -rf "$target"
+              cp -R "$SRC/$rel" "$target"
+            fi
+          done
+          if [ -f "$APP/embedded.mobileprovision" ]; then
+            rm -f "$APP/embedded.mobileprovision"
+          fi
+          find "$APP" -name '_CodeSignature' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+
+          ( cd "$STAGE" && /usr/bin/zip -qry "$GITHUB_WORKSPACE/release-packages/jf-app-$RELEASE_TAG-ios-unsigned.ipa" Payload )
+          ls -lh "release-packages/jf-app-$RELEASE_TAG-ios-unsigned.ipa"
+
+      - name: Sign IPA with purchased certificate
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/ios-signed"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/Payload"
+          APP="$STAGE/Payload/Runner.app"
+          cp -R "build/ios/iphoneos/Runner.app" "$APP"
+          find "$APP" -name '_CodeSignature' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+
+          cp "$RUNNER_TEMP/build_pp.mobileprovision" "$APP/embedded.mobileprovision"
+
+          while IFS= read -r -d '' item; do
+            echo "sign: $(basename "$item")"
+            codesign --force --sign "$SIGNING_IDENTITY" --timestamp=none "$item"
+          done < <(find "$APP/Frameworks" -maxdepth 1 \( -name '*.framework' -o -name '*.dylib' \) -print0 2>/dev/null || true)
+
+          if codesign --force --sign "$SIGNING_IDENTITY" \
+              --entitlements "$ENTITLEMENTS_PATH" \
+              --timestamp=none "$APP"; then
+            echo "主 bundle 签名完成"
+          else
+            echo "::error::codesign 失败，输出可用签名标识供排查"
+            security find-identity -v -p codesigning || true
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -d --verbose=4 "$APP" 2>&1 | grep -E "^Format=" || true
+
+          ( cd "$STAGE" && /usr/bin/zip -qry "$GITHUB_WORKSPACE/release-packages/jf-app-$RELEASE_TAG-ios.ipa" Payload )
+          ls -lh "release-packages/jf-app-$RELEASE_TAG-ios.ipa"
+
+      - name: Build profile-bound IPA
+        if: ${{ inputs.build_profile_bound_ipa }}
+        run: |
+          set -euo pipefail
+          case "${PROFILE_BUNDLE_ID:-}" in
+            ''|'*') echo "描述文件为通配或未解析，跳过额外产物"; exit 0 ;;
+          esac
+          if [ "$PROFILE_BUNDLE_ID" = "$APP_BUNDLE_ID" ]; then
+            echo "描述文件 App ID 与目标包名一致，跳过额外产物"
+            exit 0
+          fi
+          STAGE="$RUNNER_TEMP/ios-profile-bound"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/Payload"
+          APP="$STAGE/Payload/Runner.app"
+          cp -R "build/ios/iphoneos/Runner.app" "$APP"
+          find "$APP" -name '_CodeSignature' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          cp "$RUNNER_TEMP/build_pp.mobileprovision" "$APP/embedded.mobileprovision"
+
+          echo "改用描述文件 App ID（长度 ${#PROFILE_BUNDLE_ID}）"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $PROFILE_BUNDLE_ID" "$APP/Info.plist"
+
+          while IFS= read -r -d '' item; do
+            codesign --force --sign "$SIGNING_IDENTITY" --timestamp=none "$item"
+          done < <(find "$APP/Frameworks" -maxdepth 1 \( -name '*.framework' -o -name '*.dylib' \) -print0 2>/dev/null || true)
+
+          codesign --force --sign "$SIGNING_IDENTITY" \
+            --entitlements "$ENTITLEMENTS_PATH" \
+            --timestamp=none "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          ( cd "$STAGE" && /usr/bin/zip -qry "$GITHUB_WORKSPACE/release-packages/jf-app-$RELEASE_TAG-ios-profile-bound.ipa" Payload )
+          ls -lh "release-packages/jf-app-$RELEASE_TAG-ios-profile-bound.ipa"
+
+      - name: Verify produced IPAs
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release-packages/*.ipa)
+          [ "${#files[@]}" -ge 2 ] || { echo "::error::IPA 产物数量不足"; ls -l release-packages || true; exit 1; }
+          : > "$RUNNER_TEMP/SHA256SUMS"
+
+          for f in "${files[@]}"; do
+            echo "=========== $f"
+            INSPECT="$RUNNER_TEMP/inspect-$(basename "$f" .ipa)"
+            rm -rf "$INSPECT"
+            unzip -q "$f" -d "$INSPECT"
+            APP="$INSPECT/Payload/Runner.app"
+            [ -d "$APP" ] || { echo "::error::$f 结构不是 Payload/Runner.app"; exit 1; }
+
+            BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+            DISPLAY_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$APP/Info.plist" 2>/dev/null || echo '-')
+            CHECKSUMS="$(cd "$(dirname "$f")" && shasum -a 256 "$(basename "$f")" | awk '{print $1}')"
+            echo "CFBundleIdentifier: ${BUNDLE_ID}"
+            echo "CFBundleDisplayName: $DISPLAY_NAME"
+            echo "大小: $(du -h "$f" | cut -f1)"
+            echo "SHA256: $CHECKSUMS"
+            ALLOWED=0
+            if [ "$BUNDLE_ID" = "$APP_BUNDLE_ID" ]; then
+              ALLOWED=1
+            elif [ -n "${PROFILE_BUNDLE_ID:-}" ] && [ "$PROFILE_BUNDLE_ID" != "*" ] && [ "$BUNDLE_ID" = "$PROFILE_BUNDLE_ID" ]; then
+              ALLOWED=1
+              echo "（该产物按描述文件包名签名，用于直接安装/重签）"
+            fi
+            [ "$ALLOWED" = "1" ] || { echo "::error::$f 包名不符合预期"; exit 1; }
+
+            if [ -f "$APP/embedded.mobileprovision" ]; then
+              echo "embedded.mobileprovision: 有"
+              if codesign --verify --deep --strict "$APP"; then
+                echo "codesign 校验: 通过"
+              else
+                echo "::error::$f 签名校验失败"
+                exit 1
+              fi
+              codesign -d --entitlements :- "$APP" 2>/dev/null | grep -o "<key>" | wc -l | tr -d " " | sed 's/^/entitlements 条目数: /' || true
+            else
+              echo "embedded.mobileprovision: 无（unsigned）"
+            fi
+
+            echo "$CHECKSUMS  $(basename "$f")" >> "$RUNNER_TEMP/SHA256SUMS"
+          done
+
+          echo "=== SHA256SUMS ==="
+          cat "$RUNNER_TEMP/SHA256SUMS"
+          {
+            echo "### iOS 产物"
+            echo '```'
+            cat "$RUNNER_TEMP/SHA256SUMS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA artifacts
+        uses: actions/upload-artifact@v4
         with:
-          repository: ${{ secrets.PRIVATE_REPO_NAME }}
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          tag_name: ${{ inputs.tag_name }}
-          name: Release ${{ inputs.tag_name }}
-          body: ${{ inputs.release_notes }}
-          files: release-packages/*.ipa
-          fail_on_unmatched_files: true
+          name: jf-app-${{ env.RELEASE_TAG }}-ios
+          path: release-packages/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload IPAs to Release
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO_NAME }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          files=(release-packages/*.ipa)
+          [ "${#files[@]}" -ge 2 ] || { echo "::error::没有可上传的 IPA"; exit 1; }
+
+          RELEASE_JSON=$(gh api "repos/$PRIVATE_REPO/releases/tags/$RELEASE_TAG") || {
+            echo "::error::目标仓库中不存在 $RELEASE_TAG 的 Release，无法上传 IPA"
+            exit 1
+          }
+          RELEASE_ID=$(printf '%s' "$RELEASE_JSON" | jq -r '.id')
+          CURRENT_BODY=$(printf '%s' "$RELEASE_JSON" | jq -r '.body // ""')
+          if [ -z "$CURRENT_BODY" ] && [ -n "${RELEASE_NOTES:-}" ]; then
+            gh api -X PATCH "repos/$PRIVATE_REPO/releases/$RELEASE_ID" \
+              -f body="$RELEASE_NOTES" >/dev/null
+            echo "已补充 release 说明"
+          fi
+
+          status=0
+          for f in "${files[@]}"; do
+            name=$(basename "$f")
+            uploaded=0
+            for attempt in 1 2 3; do
+              if gh release upload "$RELEASE_TAG" "$f" --repo "$PRIVATE_REPO" --clobber; then
+                echo "上传成功: $name (第 $attempt 次)"
+                uploaded=1
+                break
+              fi
+              echo "::warning::$name 上传失败，10s 后重试 ($attempt/3)"
+              sleep 10
+            done
+            [ "$uploaded" = "1" ] || { echo "::error::$name 上传失败"; status=1; }
+          done
+
+          echo "=== 发布后资产 ==="
+          gh release view "$RELEASE_TAG" --repo "$PRIVATE_REPO" --json assets --jq '.assets[].name' || true
+          exit $status
+
+      - name: Report failure to release
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO_NAME }}
+        run: |
+          set -uo pipefail
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          RELEASE_JSON=$(gh api "repos/$PRIVATE_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null) || exit 0
+          RELEASE_ID=$(printf '%s' "$RELEASE_JSON" | jq -r '.id // empty')
+          [ -n "$RELEASE_ID" ] || exit 0
+          BODY=$(printf '%s' "$RELEASE_JSON" | jq -r '.body // ""')
+          NOTE=$(printf '\n\n---\n⚠️ iOS IPA 打包失败，详见 %s （Android 包不受影响）' "$RUN_URL")
+          case "$BODY" in
+            *"iOS IPA 打包失败"*) exit 0 ;;
+          esac
+          gh api -X PATCH "repos/$PRIVATE_REPO/releases/$RELEASE_ID" -f body="$BODY$NOTE" >/dev/null && echo "已回写失败状态"
 
       - name: Clean up keychain
         if: always()
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
           if [ -f "$KEYCHAIN_PATH" ]; then
-            security delete-keychain "$KEYCHAIN_PATH"
+            security delete-keychain "$KEYCHAIN_PATH" || true
           fi
