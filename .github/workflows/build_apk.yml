@@ -4,12 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: '发布版本标签 (例如: v0.1.1)'
+        description: '发布版本标签 (例如: v0.4.0)'
         required: true
         type: string
       release_notes:
         description: '版本更新说明'
         required: false
+        type: string
+      flutter_version:
+        description: 'Flutter 版本（需与客户端项目验收版本一致）'
+        required: false
+        default: '3.47.5'
         type: string
 
 permissions:
@@ -20,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ inputs.tag_name }}
+      FLUTTER_VERSION: ${{ inputs.flutter_version || '3.47.5' }}
 
     steps:
       - name: Checkout Code
@@ -38,8 +44,15 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: 'stable'
           cache: true
+
+      - name: Show toolchain versions
+        run: |
+          flutter --version
+          echo "AGP declared in project:"
+          grep -n "com.android.application" android/settings.gradle.kts || true
 
       - name: Install dependencies
         run: flutter pub get
@@ -67,8 +80,25 @@ jobs:
 
       - name: Build APKs for each architecture
         run: |
-          flutter build apk --release --split-per-abi
+          set -euo pipefail
           mkdir -p release-packages
+
+          # 依赖仓库（aliyun 镜像 / Maven Central）偶发 5xx，重试整个构建步骤。
+          for attempt in 1 2 3; do
+            echo "::group::attempt $attempt"
+            if flutter build apk --release --split-per-abi; then
+              echo "::endgroup::"
+              break
+            fi
+            echo "::endgroup::"
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::flutter build apk 连续 3 次失败，请查看上方 Gradle 输出"
+              exit 1
+            fi
+            echo "构建失败，等待 20s 后重试（多为 maven 镜像临时 5xx）"
+            sleep 20
+          done
+
           for ABI in armeabi-v7a arm64-v8a x86_64; do
             cp "build/app/outputs/flutter-apk/app-$ABI-release.apk" \
               "release-packages/jf-app-$RELEASE_TAG-android-$ABI.apk"
@@ -76,7 +106,17 @@ jobs:
 
       - name: Build universal APK
         run: |
-          flutter build apk --release
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if flutter build apk --release; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::通用包构建失败"
+              exit 1
+            fi
+            sleep 20
+          done
           cp build/app/outputs/flutter-apk/app-release.apk \
             "release-packages/jf-app-$RELEASE_TAG-android-universal.apk"
 
